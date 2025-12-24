@@ -22,7 +22,16 @@ chunks = []
 chat_history = []
 
 # ============== PDF CHUNKING ==============
-def chunk_text(text, size=500, overlap=100):
+def chunk_text(text, size=300, overlap=80):
+    if len(text) <= size:
+        # FORCE split into 3 chunks minimum
+        third = len(text) // 3
+        return [
+            text[:third],
+            text[third:2*third],
+            text[2*third:]
+        ]
+
     chunks = []
     start = 0
     while start < len(text):
