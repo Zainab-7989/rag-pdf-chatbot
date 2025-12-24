@@ -5,32 +5,51 @@ import nltk
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import faiss
-from groq import Groq
+import requests
 
-# =========================
-# NLTK AUTO-SETUP (FIXED)
-# =========================
+# =======================
+# NLTK SETUP
+# =======================
 nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
 from nltk.tokenize import sent_tokenize
 
-# =========================
-# GROQ CLIENT
-# =========================
+# =======================
+# GROQ CONFIG
+# =======================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable not set")
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+def groq_chat(prompt):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-# =========================
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3
+    }
+
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=payload
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+# =======================
 # EMBEDDING MODEL
-# =========================
+# =======================
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-# =========================
-# PDF TEXT EXTRACTION
-# =========================
+# =======================
+# PDF EXTRACTION
+# =======================
 def extract_text_from_pdfs(files):
     documents = []
     for file in files:
@@ -44,9 +63,9 @@ def extract_text_from_pdfs(files):
                 })
     return documents
 
-# =========================
-# NLTK CHUNKING
-# =========================
+# =======================
+# CHUNKING
+# =======================
 def chunk_documents(documents, max_words=200):
     chunks = []
     for doc in documents:
@@ -75,11 +94,11 @@ def chunk_documents(documents, max_words=200):
 
     return chunks
 
-# =========================
-# FAISS VECTOR STORE
-# =========================
+# =======================
+# FAISS
+# =======================
 def build_faiss_index(chunks):
-    texts = [chunk["text"] for chunk in chunks]
+    texts = [c["text"] for c in chunks]
     embeddings = embedder.encode(texts, convert_to_numpy=True)
 
     index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -87,29 +106,21 @@ def build_faiss_index(chunks):
 
     return index, chunks
 
-# =========================
-# RETRIEVAL
-# =========================
 def retrieve_chunks(question, index, chunks, k=4):
     q_embedding = embedder.encode([question], convert_to_numpy=True)
-    distances, indices = index.search(q_embedding, k)
+    _, indices = index.search(q_embedding, k)
+    return [chunks[i] for i in indices[0]]
 
-    retrieved = []
-    for idx in indices[0]:
-        retrieved.append(chunks[idx])
-
-    return retrieved
-
-# =========================
-# ANSWER GENERATION (WITH MEMORY + CITATIONS)
-# =========================
+# =======================
+# ANSWER GENERATION
+# =======================
 def generate_answer(question, retrieved_chunks, history):
     context = "\n\n".join(
-        [f"[{c['source']}]\n{c['text']}" for c in retrieved_chunks]
+        f"[{c['source']}]\n{c['text']}" for c in retrieved_chunks
     )
 
     history_text = ""
-    for q, a in history[-3:]:  # last 3 turns
+    for q, a in history[-3:]:
         history_text += f"Q: {q}\nA: {a}\n\n"
 
     prompt = f"""
@@ -128,22 +139,16 @@ Question:
 {question}
 """
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
+    answer = groq_chat(prompt)
 
-    answer = response.choices[0].message.content
-
-    sources = list(set(c["source"] for c in retrieved_chunks))
+    sources = sorted(set(c["source"] for c in retrieved_chunks))
     citations = "\n\nSources:\n" + "\n".join(f"- {s}" for s in sources)
 
     return answer + citations
 
-# =========================
-# MAIN RAG FUNCTION
-# =========================
+# =======================
+# MAIN RAG PIPELINE
+# =======================
 def rag_chat(pdf_files, question, history):
     if not pdf_files:
         return "Please upload at least one PDF.", history
@@ -158,37 +163,23 @@ def rag_chat(pdf_files, question, history):
 
     return answer, history
 
-# =========================
+# =======================
 # GRADIO UI
-# =========================
+# =======================
 with gr.Blocks(title="RAG PDF Chatbot") as demo:
-    gr.Markdown("##  RAG-Based PDF Chatbot (Groq + FAISS)")
-    gr.Markdown(
-        "Ask questions **only from the uploaded PDFs**. "
-        "The chatbot will cite exact pages used in the answer."
-    )
+    gr.Markdown("## RAG-Based PDF Chatbot (Groq + FAISS)")
+    gr.Markdown("Answers are generated strictly from uploaded PDFs with citations.")
 
-    pdf_input = gr.File(
-        file_types=[".pdf"],
-        file_count="multiple",
-        label="Upload PDF files"
-    )
-
-    question_input = gr.Textbox(
-        label="Ask a question from the documents"
-    )
-
-    answer_output = gr.Textbox(
-        label="Answer",
-        lines=10
-    )
+    pdf_input = gr.File(file_types=[".pdf"], file_count="multiple")
+    question_input = gr.Textbox(label="Ask a question")
+    answer_output = gr.Textbox(label="Answer", lines=12)
 
     chat_state = gr.State([])
 
     ask_btn = gr.Button("Ask")
 
     ask_btn.click(
-        fn=rag_chat,
+        rag_chat,
         inputs=[pdf_input, question_input, chat_state],
         outputs=[answer_output, chat_state]
     )

@@ -1,23 +1,8 @@
-gradio==4.0.0
-
-# LLM + API
-groq==0.9.0
-httpx==0.24.1
-
-# RAG stack
-faiss-cpu==1.7.4
+gradio==4.44.0
+pypdf==4.2.0
 sentence-transformers==2.6.1
-transformers==4.36.2
-torch==2.1.2
-
-# Docs
-pypdf
-python-docx
-
-# Utils
-numpy
-pandas
-scikit-learn
-tqdm
-nltk
-networkx==3.2.1
+faiss-cpu==1.7.4
+nltk==3.8.1
+numpy==1.26.4
+requests==2.31.0
+torch
