@@ -1,187 +1,124 @@
-import os
 import gradio as gr
-import numpy as np
-import nltk
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-import faiss
+import os
 import requests
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from pypdf import PdfReader
+import nltk
 
-# =======================
-# NLTK SETUP
-# =======================
-nltk.download("punkt", quiet=True)
-from nltk.tokenize import sent_tokenize
+nltk.download("punkt")
 
-# =======================
-# GROQ CONFIG
-# =======================
+# ================= CONFIG =================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY environment variable not set")
+    raise RuntimeError("GROQ_API_KEY not set in Hugging Face Secrets")
 
-def groq_chat(prompt):
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL = "llama3-70b-8192"
+
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ============== GLOBAL STATE ==============
+faiss_index = None
+chunks = []
+chat_history = []
+
+# ============== PDF PROCESSING ============
+def load_pdf(file):
+    global faiss_index, chunks, chat_history
+    chat_history = []
+
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        if page.extract_text():
+            text += page.extract_text() + "\n"
+
+    sentences = nltk.sent_tokenize(text)
+    chunks = [{"text": s, "source": file.name} for s in sentences]
+
+    embeddings = embedder.encode([c["text"] for c in chunks])
+    dim = embeddings.shape[1]
+
+    faiss_index = faiss.IndexFlatL2(dim)
+    faiss_index.add(np.array(embeddings))
+
+    return f"Loaded {len(chunks)} chunks from PDF."
+
+# ============== RETRIEVAL =================
+def retrieve(query, k=5):
+    q_emb = embedder.encode([query])
+    _, idxs = faiss_index.search(np.array(q_emb), k)
+    return [chunks[i] for i in idxs[0]]
+
+# ============== GROQ CALL =================
+def groq_chat(messages):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
-        "model": "llama-3.1-70b-versatile",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.2,
     }
 
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers=headers,
-        json=payload
-    )
+    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
     response.raise_for_status()
+
     return response.json()["choices"][0]["message"]["content"]
 
-# =======================
-# EMBEDDING MODEL
-# =======================
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# ============== ANSWER ====================
+def ask_question(question):
+    if faiss_index is None:
+        return "Please upload a PDF first."
 
-# =======================
-# PDF EXTRACTION
-# =======================
-def extract_text_from_pdfs(files):
-    documents = []
-    for file in files:
-        reader = PdfReader(file)
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text()
-            if text and text.strip():
-                documents.append({
-                    "text": text,
-                    "source": f"{file.name} - page {i+1}"
-                })
-    return documents
+    retrieved = retrieve(question)
 
-# =======================
-# CHUNKING
-# =======================
-def chunk_documents(documents, max_words=200):
-    chunks = []
-    for doc in documents:
-        sentences = sent_tokenize(doc["text"])
-        current_chunk = []
-        word_count = 0
-
-        for sentence in sentences:
-            words = sentence.split()
-            if word_count + len(words) <= max_words:
-                current_chunk.append(sentence)
-                word_count += len(words)
-            else:
-                chunks.append({
-                    "text": " ".join(current_chunk),
-                    "source": doc["source"]
-                })
-                current_chunk = [sentence]
-                word_count = len(words)
-
-        if current_chunk:
-            chunks.append({
-                "text": " ".join(current_chunk),
-                "source": doc["source"]
-            })
-
-    return chunks
-
-# =======================
-# FAISS
-# =======================
-def build_faiss_index(chunks):
-    texts = [c["text"] for c in chunks]
-    embeddings = embedder.encode(texts, convert_to_numpy=True)
-
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-
-    return index, chunks
-
-def retrieve_chunks(question, index, chunks, k=4):
-    q_embedding = embedder.encode([question], convert_to_numpy=True)
-    _, indices = index.search(q_embedding, k)
-    return [chunks[i] for i in indices[0]]
-
-# =======================
-# ANSWER GENERATION
-# =======================
-def generate_answer(question, retrieved_chunks, history):
     context = "\n\n".join(
-        f"[{c['source']}]\n{c['text']}" for c in retrieved_chunks
+        f"[{c['source']}]\n{c['text']}" for c in retrieved
     )
 
     history_text = ""
-    for q, a in history[-3:]:
+    for q, a in chat_history[-3:]:
         history_text += f"Q: {q}\nA: {a}\n\n"
 
-    prompt = f"""
-You are a document-based assistant.
-Answer ONLY using the provided context.
-If the answer is not present, say:
-"Answer not found in the uploaded documents."
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Answer strictly from the provided context. "
+                "If not found, say: Answer not found in the document."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"{history_text}\nContext:\n{context}\n\nQuestion:\n{question}",
+        },
+    ]
 
-Conversation History:
-{history_text}
+    answer = groq_chat(messages)
 
-Context:
-{context}
-
-Question:
-{question}
-"""
-
-    answer = groq_chat(prompt)
-
-    sources = sorted(set(c["source"] for c in retrieved_chunks))
+    sources = sorted(set(c["source"] for c in retrieved))
     citations = "\n\nSources:\n" + "\n".join(f"- {s}" for s in sources)
 
+    chat_history.append((question, answer))
     return answer + citations
 
-# =======================
-# MAIN RAG PIPELINE
-# =======================
-def rag_chat(pdf_files, question, history):
-    if not pdf_files:
-        return "Please upload at least one PDF.", history
-
-    documents = extract_text_from_pdfs(pdf_files)
-    chunks = chunk_documents(documents)
-    index, chunks = build_faiss_index(chunks)
-    retrieved = retrieve_chunks(question, index, chunks)
-
-    answer = generate_answer(question, retrieved, history)
-    history.append((question, answer))
-
-    return answer, history
-
-# =======================
-# GRADIO UI
-# =======================
-with gr.Blocks(title="RAG PDF Chatbot") as demo:
+# ============== UI ========================
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("## RAG-Based PDF Chatbot (Groq + FAISS)")
     gr.Markdown("Answers are generated strictly from uploaded PDFs with citations.")
 
-    pdf_input = gr.File(file_types=[".pdf"], file_count="multiple")
-    question_input = gr.Textbox(label="Ask a question")
-    answer_output = gr.Textbox(label="Answer", lines=12)
+    file = gr.File(label="Upload PDF", file_types=[".pdf"])
+    status = gr.Textbox(label="Status", interactive=False)
 
-    chat_state = gr.State([])
+    question = gr.Textbox(label="Ask a question")
+    answer = gr.Textbox(label="Answer", lines=10)
 
-    ask_btn = gr.Button("Ask")
-
-    ask_btn.click(
-        rag_chat,
-        inputs=[pdf_input, question_input, chat_state],
-        outputs=[answer_output, chat_state]
-    )
+    file.upload(load_pdf, file, status)
+    question.submit(ask_question, question, answer)
 
 demo.launch()
