@@ -1,14 +1,23 @@
 gradio==4.0.0
+
+# LLM + API
+groq==0.9.0
+httpx==0.24.1
+
+# RAG stack
 faiss-cpu==1.7.4
 sentence-transformers==2.6.1
 transformers==4.36.2
 torch==2.1.2
-groq==0.9.0
+
+# Docs
+pypdf
+python-docx
+
+# Utils
 numpy
 pandas
 scikit-learn
-pypdf
-python-docx
-nltk
 tqdm
+nltk
 networkx==3.2.1
