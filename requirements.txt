@@ -1,6 +1,6 @@
 gradio==4.0.0
 faiss-cpu==1.7.4
-sentence-transformers==2.2.2
+sentence-transformers==2.6.1
 transformers==4.36.2
 torch==2.1.2
 numpy
@@ -10,5 +10,4 @@ pypdf
 python-docx
 nltk
 tqdm
-huggingface-hub
 networkx==3.2.1
