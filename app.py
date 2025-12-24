@@ -1,36 +1,75 @@
-import gradio as gr
 import os
-import requests
+import gradio as gr
+import nltk
 import numpy as np
+import requests
 import faiss
-from sentence_transformers import SentenceTransformer
-from pypdf import PdfReader
 
-# ================= CONFIG =================
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+from nltk.tokenize import sent_tokenize
+
+# -------------------- SETUP --------------------
+
+nltk.download("punkt", quiet=True)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY missing in Hugging Face Secrets")
+    raise RuntimeError("GROQ_API_KEY not set")
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama3-70b-8192"
+EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# -------------------- GROQ CALL (SAFE) --------------------
 
-# ============== STATE =====================
-faiss_index = None
-chunks = []
-chat_history = []
+def groq_chat(messages):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-# ============== PDF CHUNKING ==============
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": messages,
+        "temperature": 0.3
+    }
+
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=25
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if "choices" not in data or len(data["choices"]) == 0:
+            return "Model did not return a response. Please try again."
+
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        return f"Error contacting model: {str(e)}"
+
+# -------------------- PDF PROCESSING --------------------
+
+def extract_text(files):
+    docs = []
+    for f in files:
+        reader = PdfReader(f)
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text and text.strip():
+                docs.append({
+                    "text": text,
+                    "source": f"{f.name} - page {i+1}"
+                })
+    return docs
+
 def chunk_text(text, size=300, overlap=80):
     if len(text) <= size:
-        # FORCE split into 3 chunks minimum
         third = len(text) // 3
-        return [
-            text[:third],
-            text[third:2*third],
-            text[2*third:]
-        ]
+        return [text[:third], text[third:2*third], text[2*third:]]
 
     chunks = []
     start = 0
@@ -40,121 +79,99 @@ def chunk_text(text, size=300, overlap=80):
         start += size - overlap
     return chunks
 
-def load_pdf(file):
-    global faiss_index, chunks, chat_history
-    chat_history = []
+def build_chunks(docs):
+    chunks = []
+    for d in docs:
+        parts = chunk_text(d["text"])
+        for p in parts:
+            if p.strip():
+                chunks.append({
+                    "text": p,
+                    "source": d["source"]
+                })
+    return chunks
 
-    reader = PdfReader(file)
-    full_text = ""
+def build_index(chunks):
+    texts = [c["text"] for c in chunks]
+    embeds = EMBEDDER.encode(texts, convert_to_numpy=True)
+    index = faiss.IndexFlatL2(embeds.shape[1])
+    index.add(embeds)
+    return index
 
-    for page in reader.pages:
-        txt = page.extract_text()
-        if txt:
-            full_text += txt + "\n"
-
-    if not full_text.strip():
-        return "PDF has no extractable text."
-
-    raw_chunks = chunk_text(full_text)
-
-    chunks = [{"text": c, "source": file.name} for c in raw_chunks]
-
-    embeddings = embedder.encode([c["text"] for c in chunks])
-    dim = embeddings.shape[1]
-
-    faiss_index = faiss.IndexFlatL2(dim)
-    faiss_index.add(np.array(embeddings))
-
-    return f"PDF loaded ({len(chunks)} chunks indexed)"
-
-# ============== RETRIEVAL =================
-def retrieve(query, k=5):
-    q_emb = embedder.encode([query])
-    _, idxs = faiss_index.search(np.array(q_emb), k)
+def retrieve(question, index, chunks, k=4):
+    q_emb = EMBEDDER.encode([question], convert_to_numpy=True)
+    _, idxs = index.search(q_emb, k)
     return [chunks[i] for i in idxs[0]]
 
-# ============== GROQ CALL =================
-def call_groq(messages):
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+# -------------------- ANSWER --------------------
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.2,
-    }
+def answer_question(files, question, history):
+    if not files or not question.strip():
+        return "Upload PDF(s) and ask a question.", history
 
-    try:
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-        r.raise_for_status()
-        data = r.json()
+    docs = extract_text(files)
+    chunks = build_chunks(docs)
 
-        if "choices" not in data or not data["choices"]:
-            return None
+    if not chunks:
+        return "No readable text found in PDFs.", history
 
-        return data["choices"][0]["message"]["content"]
+    index = build_index(chunks)
+    retrieved = retrieve(question, index, chunks)
 
-    except Exception as e:
-        return None
+    context = "\n\n".join(
+        f"[{c['source']}]\n{c['text']}" for c in retrieved
+    )
 
-# ============== QA ========================
-def ask_question(question):
-    if not question.strip():
-        return "Please enter a question."
-
-    if faiss_index is None:
-        return "Please upload a PDF first."
-
-    retrieved = retrieve(question)
-
-    context = "\n\n".join(c["text"] for c in retrieved)
-
-    history = ""
-    for q, a in chat_history[-3:]:
-        history += f"Q: {q}\nA: {a}\n\n"
+    history_text = ""
+    for q, a in history[-3:]:
+        history_text += f"Q: {q}\nA: {a}\n\n"
 
     messages = [
         {
             "role": "system",
-            "content": (
-                "Answer ONLY from the provided context. "
-                "If the answer is not in the document, say so clearly."
-            ),
+            "content": "Answer strictly from the provided context. If not found, say so."
         },
         {
             "role": "user",
-            "content": f"{history}\nContext:\n{context}\n\nQuestion:\n{question}",
-        },
+            "content": f"""
+Conversation history:
+{history_text}
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+        }
     ]
 
-    answer = call_groq(messages)
-
-    if answer is None:
-        return "Model did not return a response. Please try again."
+    answer = groq_chat(messages)
 
     sources = sorted(set(c["source"] for c in retrieved))
     citation = "\n\nSources:\n" + "\n".join(f"- {s}" for s in sources)
 
-    chat_history.append((question, answer))
-    return answer + citation
+    final = answer + citation
+    history.append((question, final))
+    return final, history
 
-# ============== UI ========================
-with gr.Blocks(theme=gr.themes.Default()) as demo:
-    gr.Markdown("### RAG-Based PDF Chatbot (Groq + FAISS)")
-    gr.Markdown(
-        "Answers are generated strictly from uploaded PDFs with citations.\n\n"
-        "**Built with Gradio + Groq API**"
+# -------------------- UI --------------------
+
+with gr.Blocks() as demo:
+    gr.Markdown("### Built with Gradio + Groq API")
+
+    pdfs = gr.File(
+        file_types=[".pdf"],
+        file_count="multiple",
+        label="Upload PDF(s)"
     )
 
-    file = gr.File(label="Upload PDF", file_types=[".pdf"])
-    status = gr.Textbox(label="Status", interactive=False)
-
     question = gr.Textbox(label="Ask a question")
-    answer = gr.Textbox(label="Answer", lines=8)
+    answer = gr.Textbox(label="Answer", lines=10)
 
-    file.upload(load_pdf, file, status)
-    question.submit(ask_question, question, answer)
+    state = gr.State([])
+
+    btn = gr.Button("Ask")
+    btn.click(answer_question, [pdfs, question, state], [answer, state])
 
 demo.launch()
